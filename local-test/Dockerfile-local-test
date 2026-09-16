@@ -1,0 +1,15 @@
+FROM otel/opentelemetry-collector-contrib:0.132.0 AS otel
+FROM python:3.12-slim
+RUN useradd --system --uid 10001 --create-home otel \
+    && mkdir -p /etc/otelcol-contrib /var/lib/otel-policy \
+    && chown -R otel:otel /etc/otelcol-contrib /var/lib/otel-policy
+COPY --from=otel /otelcol-contrib /usr/local/bin/otelcol-contrib
+WORKDIR /app
+COPY requirements-local-test.txt /app/requirements-local-test.txt
+RUN pip install --no-cache-dir -r /app/requirements-local-test.txt
+COPY policy-supervisor-local-test.py /app/policy-supervisor-local-test.py
+COPY collector-config-local-test.yaml /etc/otelcol-contrib/config.template.yaml
+COPY backend-policy-defaults-local-test.yaml /etc/otelcol-contrib/backend-policy-defaults.yaml
+USER otel
+EXPOSE 4317 4318 13133
+ENTRYPOINT ["python", "/app/policy-supervisor-local-test.py"]

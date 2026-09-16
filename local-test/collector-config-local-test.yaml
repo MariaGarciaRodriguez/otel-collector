@@ -1,0 +1,207 @@
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # Prepared for Microsoft Agent 365. The supervisor removes it while the
+  # Agent365 backend flag is false.
+  oauth2client/agent365:
+    client_id: ${env:AGENT365_AGENT_ID}
+    client_secret: ${env:AGENT365_CLIENT_SECRET}
+    token_url: https://login.microsoftonline.com/${env:AGENT365_TENANT_ID}/oauth2/v2.0/token
+    scopes:
+      - 9b975845-388f-4429-889e-eab1ef63949c/.default
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+
+  # Dynatrace: never export captured GenAI/tool content.
+  transform/privacy_dynatrace:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - 'delete_key(attributes, "gen_ai.input.messages")'
+          - 'delete_key(attributes, "gen_ai.output.messages")'
+          - 'delete_key(attributes, "gen_ai.tool.call.arguments")'
+          - 'delete_key(attributes, "gen_ai.tool.call.result")'
+          - 'delete_matching_keys(attributes, "^gen_ai\\.prompt\\.")'
+          - 'delete_matching_keys(attributes, "^gen_ai\\.completion\\.")'
+          - 'delete_matching_keys(attributes, "^llm\\.prompts")'
+          - 'delete_matching_keys(attributes, "^llm\\.completions")'
+
+  attributes/log_privacy:
+    actions:
+      - key: gen_ai.input.messages
+        action: delete
+      - key: gen_ai.output.messages
+        action: delete
+      - key: gen_ai.tool.call.arguments
+        action: delete
+      - key: gen_ai.tool.call.result
+        action: delete
+
+  cumulativetodelta: {}
+
+  # Python overwrites this only when global Arize is ON.
+  # true => drop every ResourceSpans => Arize effectively OFF.
+  filter/arize_allowlist:
+    error_mode: ignore
+    traces:
+      resource:
+        - 'true'
+
+  # OpenTelemetry/OpenLLMetry -> OpenInference, ONLY on the Arize branch.
+  transform/openinference:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - 'set(attributes["session.id"], attributes["platform.session.id"]) where attributes["platform.session.id"] != nil and attributes["session.id"] == nil'
+          - 'set(attributes["session.id"], attributes["gen_ai.conversation.id"]) where attributes["gen_ai.conversation.id"] != nil and attributes["session.id"] == nil'
+          - 'set(attributes["user.id"], attributes["enduser.id"]) where attributes["enduser.id"] != nil and attributes["user.id"] == nil'
+
+          # Specific classification: avoid inherited provider/model attributes
+          # incorrectly turning framework/agent spans into LLM spans.
+          - 'set(attributes["openinference.span.kind"], "AGENT") where attributes["gen_ai.operation.name"] == "invoke_agent" or attributes["traceloop.span.kind"] == "agent" or name == "agent.run"'
+          - 'set(attributes["openinference.span.kind"], "LLM") where attributes["gen_ai.operation.name"] == "chat" or attributes["gen_ai.operation.name"] == "text_completion" or attributes["gen_ai.operation.name"] == "generate_content"'
+          - 'set(attributes["openinference.span.kind"], "CHAIN") where attributes["traceloop.span.kind"] == "workflow" or attributes["traceloop.span.kind"] == "task" or name == "agent.output_messages"'
+          - 'set(attributes["openinference.span.kind"], "TOOL") where attributes["traceloop.span.kind"] == "tool" or attributes["gen_ai.operation.name"] == "execute_tool"'
+          - 'set(attributes["openinference.span.kind"], "RETRIEVER") where attributes["gen_ai.operation.name"] == "retrieval"'
+          - 'set(attributes["openinference.span.kind"], "EMBEDDING") where attributes["gen_ai.operation.name"] == "embeddings"'
+
+          - 'set(attributes["agent.name"], attributes["gen_ai.agent.name"]) where attributes["gen_ai.agent.name"] != nil and attributes["agent.name"] == nil'
+          - 'set(attributes["agent.name"], attributes["traceloop.entity.name"]) where attributes["openinference.span.kind"] == "AGENT" and attributes["traceloop.entity.name"] != nil and attributes["agent.name"] == nil'
+
+          - 'set(attributes["llm.system"], attributes["gen_ai.system"]) where attributes["gen_ai.system"] != nil'
+          - 'set(attributes["llm.provider"], attributes["gen_ai.provider.name"]) where attributes["gen_ai.provider.name"] != nil'
+          - 'set(attributes["llm.model_name"], attributes["gen_ai.request.model"]) where attributes["gen_ai.request.model"] != nil'
+          - 'set(attributes["llm.model_name"], attributes["gen_ai.response.model"]) where attributes["gen_ai.response.model"] != nil'
+
+          - 'set(attributes["llm.token_count.prompt"], attributes["gen_ai.usage.input_tokens"]) where attributes["gen_ai.usage.input_tokens"] != nil'
+          - 'set(attributes["llm.token_count.prompt"], attributes["gen_ai.usage.prompt_tokens"]) where attributes["gen_ai.usage.input_tokens"] == nil and attributes["gen_ai.usage.prompt_tokens"] != nil'
+          - 'set(attributes["llm.token_count.completion"], attributes["gen_ai.usage.output_tokens"]) where attributes["gen_ai.usage.output_tokens"] != nil'
+          - 'set(attributes["llm.token_count.completion"], attributes["gen_ai.usage.completion_tokens"]) where attributes["gen_ai.usage.output_tokens"] == nil and attributes["gen_ai.usage.completion_tokens"] != nil'
+          - 'set(attributes["llm.token_count.total"], attributes["gen_ai.usage.total_tokens"]) where attributes["gen_ai.usage.total_tokens"] != nil'
+
+          # Modern OTel GenAI payloads -> Phoenix main Input/Output panels.
+          - 'set(attributes["input.value"], attributes["gen_ai.input.messages"]) where attributes["gen_ai.input.messages"] != nil'
+          - 'set(attributes["input.mime_type"], "application/json") where attributes["gen_ai.input.messages"] != nil'
+          - 'set(attributes["output.value"], attributes["gen_ai.output.messages"]) where attributes["gen_ai.output.messages"] != nil'
+          - 'set(attributes["output.mime_type"], "application/json") where attributes["gen_ai.output.messages"] != nil'
+
+          # Legacy flattened messages.
+          - 'replace_all_patterns(attributes, "key", "^gen_ai\\.prompt\\.([0-9]+)\\.role", "llm.input_messages.$$1.message.role")'
+          - 'replace_all_patterns(attributes, "key", "^gen_ai\\.prompt\\.([0-9]+)\\.content", "llm.input_messages.$$1.message.content")'
+          - 'replace_all_patterns(attributes, "key", "^gen_ai\\.completion\\.([0-9]+)\\.role", "llm.output_messages.$$1.message.role")'
+          - 'replace_all_patterns(attributes, "key", "^gen_ai\\.completion\\.([0-9]+)\\.content", "llm.output_messages.$$1.message.content")'
+
+          - 'set(attributes["tool.name"], attributes["gen_ai.tool.name"]) where attributes["gen_ai.tool.name"] != nil'
+          - 'set(attributes["tool.description"], attributes["gen_ai.tool.description"]) where attributes["gen_ai.tool.description"] != nil'
+          - 'set(attributes["tool.id"], attributes["gen_ai.tool.call.id"]) where attributes["gen_ai.tool.call.id"] != nil'
+          - 'set(attributes["input.value"], attributes["gen_ai.tool.call.arguments"]) where attributes["openinference.span.kind"] == "TOOL" and attributes["gen_ai.tool.call.arguments"] != nil'
+          - 'set(attributes["input.mime_type"], "application/json") where attributes["openinference.span.kind"] == "TOOL" and attributes["gen_ai.tool.call.arguments"] != nil'
+          - 'set(attributes["output.value"], attributes["gen_ai.tool.call.result"]) where attributes["openinference.span.kind"] == "TOOL" and attributes["gen_ai.tool.call.result"] != nil'
+          - 'set(attributes["output.mime_type"], "application/json") where attributes["openinference.span.kind"] == "TOOL" and attributes["gen_ai.tool.call.result"] != nil'
+
+  # Existing Agent365 projection kept prepared. Current flag is false.
+  filter/agent365:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["agent365.export"] != true'
+
+  transform/agent365:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - 'set(attributes["microsoft.tenant.id"], attributes["agent365.canonical.microsoft.tenant.id"]) where attributes["agent365.canonical.microsoft.tenant.id"] != nil'
+          - 'set(attributes["gen_ai.agent.id"], attributes["agent365.canonical.gen_ai.agent.id"]) where attributes["agent365.canonical.gen_ai.agent.id"] != nil'
+          - 'set(attributes["gen_ai.agent.name"], attributes["agent365.canonical.gen_ai.agent.name"]) where attributes["agent365.canonical.gen_ai.agent.name"] != nil'
+          - 'set(attributes["microsoft.a365.agent.blueprint.id"], attributes["agent365.canonical.microsoft.a365.agent.blueprint.id"]) where attributes["agent365.canonical.microsoft.a365.agent.blueprint.id"] != nil'
+          - 'set(attributes["microsoft.channel.name"], attributes["agent365.canonical.microsoft.channel.name"]) where attributes["agent365.canonical.microsoft.channel.name"] != nil'
+          - 'set(attributes["gen_ai.conversation.id"], attributes["agent365.canonical.gen_ai.conversation.id"]) where attributes["agent365.canonical.gen_ai.conversation.id"] != nil'
+          - 'set(attributes["microsoft.session.id"], attributes["agent365.canonical.microsoft.session.id"]) where attributes["agent365.canonical.microsoft.session.id"] != nil'
+          - 'set(attributes["correlation.id"], attributes["agent365.canonical.correlation.id"]) where attributes["agent365.canonical.correlation.id"] != nil'
+          - 'set(attributes["operation.source"], attributes["agent365.canonical.operation.source"]) where attributes["agent365.canonical.operation.source"] != nil'
+          - 'delete_key(attributes, "agent365.export")'
+          - 'delete_key(attributes, "agent365.root_span_id")'
+          - 'stringify_all(attributes)'
+
+  batch/dynatrace:
+    timeout: 5s
+    send_batch_size: 512
+  batch/arize:
+    timeout: 2s
+    send_batch_size: 256
+  batch/agent365:
+    timeout: 5s
+    send_batch_size: 256
+
+exporters:
+  otlphttp/dynatrace:
+    endpoint: ${env:DT_OTLP_ENDPOINT}
+    tls:
+      insecure_skip_verify: ${env:DT_TLS_INSECURE_SKIP_VERIFY}
+    headers:
+      Authorization: "Api-Token ${env:DT_API_TOKEN}"
+
+  otlphttp/arize:
+    endpoint: ${env:PHOENIX_OTLP_ENDPOINT}
+    headers:
+      x-project-name: ${env:PHOENIX_PROJECT_NAME}
+
+  otlphttp/agent365:
+    traces_endpoint: https://agent365.svc.cloud.microsoft/observabilityService/tenants/${env:AGENT365_TENANT_ID}/otlp/agents/${env:AGENT365_AGENT_ID}/traces?api-version=1
+    encoding: json
+    auth:
+      authenticator: oauth2client/agent365
+
+  debug:
+    verbosity: basic
+
+service:
+  extensions:
+    - health_check
+    - oauth2client/agent365
+
+  pipelines:
+    traces/dynatrace:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/privacy_dynatrace, batch/dynatrace]
+      exporters: [otlphttp/dynatrace]
+
+    metrics/dynatrace:
+      receivers: [otlp]
+      processors: [memory_limiter, cumulativetodelta, batch/dynatrace]
+      exporters: [otlphttp/dynatrace]
+
+    logs/dynatrace:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/log_privacy, batch/dynatrace]
+      exporters: [otlphttp/dynatrace]
+
+    traces/agent365:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/agent365, transform/agent365, batch/agent365]
+      exporters: [otlphttp/agent365]
+
+    traces/arize:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/arize_allowlist, transform/openinference, batch/arize]
+      exporters: [otlphttp/arize]
+
+  telemetry:
+    logs:
+      level: info

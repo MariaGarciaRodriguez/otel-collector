@@ -1,0 +1,68 @@
+services:
+  dynamodb-local-test:
+    image: amazon/dynamodb-local:latest
+    container_name: dynamodb-local-test
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8000:8000"
+
+  dynamodb-init-local-test:
+    image: python:3.12-slim
+    container_name: dynamodb-init-local-test
+    depends_on:
+      - dynamodb-local-test
+    working_dir: /app
+    volumes:
+      - ./init-dynamodb-local-test.py:/app/init-dynamodb-local-test.py:ro
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: eu-west-1
+      DYNAMODB_ENDPOINT: http://dynamodb-local-test:8000
+      BACKEND_POLICY_TABLE: otel-observability-backend-policy-local-test
+    command: >
+      sh -c "pip install --no-cache-dir boto3==1.40.30 && python /app/init-dynamodb-local-test.py"
+    restart: "no"
+
+  phoenix-local-test:
+    image: arizephoenix/phoenix:latest
+    container_name: phoenix-local-test
+    ports:
+      - "6006:6006"
+    volumes:
+      - phoenix-local-test-data:/mnt/data
+
+  otel-collector-local-test:
+    build:
+      context: .
+      dockerfile: Dockerfile-local-test
+    container_name: otel-collector-local-test
+    depends_on:
+      dynamodb-init-local-test:
+        condition: service_completed_successfully
+      phoenix-local-test:
+        condition: service_started
+    env_file:
+      - .env-local-test
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "13133:13133"
+    restart: unless-stopped
+
+  policy-cli-local-test:
+    image: python:3.12-slim
+    profiles: ["tools"]
+    working_dir: /app
+    volumes:
+      - ./policy-cli-local-test.py:/app/policy-cli-local-test.py:ro
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: eu-west-1
+      DYNAMODB_ENDPOINT: http://dynamodb-local-test:8000
+      BACKEND_POLICY_TABLE: otel-observability-backend-policy-local-test
+    entrypoint: ["sh", "-c", "pip install -q boto3==1.40.30 && python /app/policy-cli-local-test.py $$@", "--"]
+
+volumes:
+  phoenix-local-test-data:
