@@ -5,7 +5,7 @@
       "Sid": "ReadCollectorBackendPolicy",
       "Effect": "Allow",
       "Action": ["dynamodb:DescribeTable", "dynamodb:Scan"],
-      "Resource": "arn:aws:dynamodb:eu-west-1:ACCOUNT_ID:table/otel-observability-backend-policy"
+      "Resource": "arn:aws:dynamodb:eu-west-1:ACCOUNT_ID:table/otel-arize-enabled-agents"
     }
   ]
 }

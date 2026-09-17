@@ -1,4 +1,9 @@
+# Static startup configuration. Change these in the central Collector repository/deployment.
+# DynamoDB is NOT used for these flags; DynamoDB is only the hot Arize allow-list.
 backends:
-  dynatrace: true
-  agent365: false
-  arize: false
+  dynatrace:
+    enabled: true
+  agent365:
+    enabled: false
+  arize:
+    enabled: true

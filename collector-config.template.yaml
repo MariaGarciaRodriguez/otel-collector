@@ -53,8 +53,8 @@ processors:
 
   cumulativetodelta: {}
 
-  # Python overwrites this only when global Arize is ON.
-  # true => drop every ResourceSpans => Arize effectively OFF.
+  # Python overwrites this from the DynamoDB agent allow-list.
+  # Empty table => true => drop every ResourceSpans => no agent goes to Arize.
   filter/arize_allowlist:
     error_mode: ignore
     traces:

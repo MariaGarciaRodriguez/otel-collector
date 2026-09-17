@@ -19,7 +19,7 @@ services:
       AWS_SECRET_ACCESS_KEY: local
       AWS_DEFAULT_REGION: eu-west-1
       DYNAMODB_ENDPOINT: http://dynamodb-local-test:8000
-      BACKEND_POLICY_TABLE: otel-observability-backend-policy-local-test
+      ARIZE_ALLOWLIST_TABLE: otel-arize-enabled-agents-local-test
     command: >
       sh -c "pip install --no-cache-dir boto3==1.40.30 && python /app/init-dynamodb-local-test.py"
     restart: "no"
@@ -61,7 +61,7 @@ services:
       AWS_SECRET_ACCESS_KEY: local
       AWS_DEFAULT_REGION: eu-west-1
       DYNAMODB_ENDPOINT: http://dynamodb-local-test:8000
-      BACKEND_POLICY_TABLE: otel-observability-backend-policy-local-test
+      ARIZE_ALLOWLIST_TABLE: otel-arize-enabled-agents-local-test
     entrypoint: ["sh", "-c", "pip install -q boto3==1.40.30 && python /app/policy-cli-local-test.py $$@", "--"]
 
 volumes:

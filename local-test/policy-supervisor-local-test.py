@@ -18,90 +18,73 @@ from botocore.config import Config as BotoConfig
 LOG = logging.getLogger("otel-policy-supervisor")
 TEMPLATE = Path(os.getenv("OTEL_CONFIG_TEMPLATE", "/etc/otelcol-contrib/config.template.yaml"))
 ACTIVE = Path(os.getenv("OTEL_CONFIG_ACTIVE", "/var/lib/otel-policy/config.yaml"))
-DEFAULTS_FILE = Path(os.getenv("BACKEND_POLICY_DEFAULTS", "/etc/otelcol-contrib/backend-policy-defaults.yaml"))
-TABLE = os.getenv("BACKEND_POLICY_TABLE", "otel-observability-backend-policy")
+BACKEND_CONFIG = Path(os.getenv("BACKEND_CONFIG", "/etc/otelcol-contrib/backend-policy-defaults.yaml"))
+TABLE = os.getenv("ARIZE_ALLOWLIST_TABLE", "otel-arize-enabled-agents")
 REGION = os.getenv("AWS_REGION", "eu-west-1")
-DYNAMODB_ENDPOINT = os.getenv("DYNAMODB_ENDPOINT")  # local-test only
-INTERVAL = int(os.getenv("BACKEND_POLICY_REFRESH_SECONDS", "15"))
+DYNAMODB_ENDPOINT = os.getenv("DYNAMODB_ENDPOINT")
+INTERVAL = int(os.getenv("ARIZE_ALLOWLIST_REFRESH_SECONDS", "15"))
 ROUTING_ATTRIBUTE = os.getenv("ARIZE_ROUTING_RESOURCE_ATTRIBUTE", "service.name")
 OTELCOL = os.getenv("OTELCOL_BINARY", "/usr/local/bin/otelcol-contrib")
 
 
 @dataclass(frozen=True)
-class Policy:
+class BackendConfig:
     dynatrace: bool
     agent365: bool
     arize: bool
-    arize_services: frozenset[str]
 
 
-def load_defaults() -> dict[str, bool]:
-    raw = yaml.safe_load(DEFAULTS_FILE.read_text(encoding="utf-8")) or {}
-    backends = raw.get("backends", {})
-    return {
-        "dynatrace": bool(backends.get("dynatrace", True)),
-        "agent365": bool(backends.get("agent365", False)),
-        "arize": bool(backends.get("arize", False)),
-    }
+def load_backend_config() -> BackendConfig:
+    raw = yaml.safe_load(BACKEND_CONFIG.read_text(encoding="utf-8")) or {}
+    b = raw.get("backends", {})
+    def enabled(name: str, default: bool) -> bool:
+        value = b.get(name, default)
+        if isinstance(value, dict):
+            return bool(value.get("enabled", default))
+        return bool(value)
+    return BackendConfig(
+        dynatrace=enabled("dynatrace", True),
+        agent365=enabled("agent365", False),
+        arize=enabled("arize", True),
+    )
 
 
 def dynamodb_client():
     kwargs = {
         "service_name": "dynamodb",
         "region_name": REGION,
-        "config": BotoConfig(
-            retries={"max_attempts": 4, "mode": "standard"},
-            connect_timeout=3,
-            read_timeout=5,
-        ),
+        "config": BotoConfig(retries={"max_attempts": 4, "mode": "standard"}, connect_timeout=3, read_timeout=5),
     }
     if DYNAMODB_ENDPOINT:
         kwargs["endpoint_url"] = DYNAMODB_ENDPOINT
     return boto3.client(**kwargs)
 
 
-def read_policy(ddb, defaults: dict[str, bool]) -> Policy:
-    """Read the complete policy table. This runs periodically, never per span."""
-    backend = dict(defaults)
-    arize_services: set[str] = set()
-    args = {"TableName": TABLE, "ConsistentRead": True}
-
+def read_arize_allowlist(ddb) -> frozenset[str]:
+    """Read agent IDs from DynamoDB. Presence means Arize ON for that agent."""
+    agents: set[str] = set()
+    args = {"TableName": TABLE, "ProjectionExpression": "agent_id", "ConsistentRead": True}
     while True:
         response = ddb.scan(**args)
         for item in response.get("Items", []):
-            key = item.get("policy_key", {}).get("S", "")
-            enabled = item.get("enabled", {}).get("BOOL", True)
-
-            if key.startswith("backend#"):
-                name = key.split("#", 1)[1]
-                if name in backend:
-                    backend[name] = enabled
-            elif key.startswith("arize_service#") and enabled:
-                service = key.split("#", 1)[1].strip()
-                if service:
-                    arize_services.add(service)
-
+            agent_id = item.get("agent_id", {}).get("S", "").strip()
+            if agent_id:
+                agents.add(agent_id)
         last_key = response.get("LastEvaluatedKey")
         if not last_key:
             break
         args["ExclusiveStartKey"] = last_key
-
-    return Policy(
-        dynatrace=backend["dynatrace"],
-        agent365=backend["agent365"],
-        arize=backend["arize"],
-        arize_services=frozenset(arize_services),
-    )
+    return frozenset(agents)
 
 
-def arize_drop_condition(services: frozenset[str]) -> str:
-    # filterprocessor drops ResourceSpans when the condition evaluates to true.
-    if not services:
+def arize_drop_condition(agent_ids: frozenset[str]) -> str:
+    # filterprocessor drops ResourceSpans when true. Empty allow-list => drop all.
+    if not agent_ids:
         return "true"
     key = json.dumps(ROUTING_ATTRIBUTE)
     return " and ".join(
-        f"resource.attributes[{key}] != {json.dumps(service)}"
-        for service in sorted(services)
+        f"resource.attributes[{key}] != {json.dumps(agent_id)}"
+        for agent_id in sorted(agent_ids)
     )
 
 
@@ -109,31 +92,26 @@ def remove_pipeline(config: dict, pipeline_name: str) -> None:
     config.get("service", {}).get("pipelines", {}).pop(pipeline_name, None)
 
 
-def render_config(policy: Policy, output: Path) -> None:
+def render_config(backends: BackendConfig, allowlist: frozenset[str], output: Path) -> None:
     config = yaml.safe_load(TEMPLATE.read_text(encoding="utf-8"))
 
-    # Dynatrace carries traces + metrics + logs. Remove the whole backend if OFF.
-    if not policy.dynatrace:
+    if not backends.dynatrace:
         for name in ("traces/dynatrace", "metrics/dynatrace", "logs/dynatrace"):
             remove_pipeline(config, name)
         config.get("exporters", {}).pop("otlphttp/dynatrace", None)
 
-    # Agent 365 is prepared but currently OFF by default.
-    if not policy.agent365:
+    if not backends.agent365:
         remove_pipeline(config, "traces/agent365")
         config.get("exporters", {}).pop("otlphttp/agent365", None)
         config.get("extensions", {}).pop("oauth2client/agent365", None)
         extensions = config.get("service", {}).get("extensions", [])
         config["service"]["extensions"] = [x for x in extensions if x != "oauth2client/agent365"]
 
-    # Arize has a global master flag AND a per-service allow-list.
-    if not policy.arize:
+    if not backends.arize:
         remove_pipeline(config, "traces/arize")
         config.get("exporters", {}).pop("otlphttp/arize", None)
     else:
-        config["processors"]["filter/arize_allowlist"]["traces"]["resource"] = [
-            arize_drop_condition(policy.arize_services)
-        ]
+        config["processors"]["filter/arize_allowlist"]["traces"]["resource"] = [arize_drop_condition(allowlist)]
 
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_suffix(".tmp")
@@ -142,89 +120,61 @@ def render_config(policy: Policy, output: Path) -> None:
 
 
 def validate_config(path: Path) -> None:
-    proc = subprocess.run(
-        [OTELCOL, "validate", f"--config={path}"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    proc = subprocess.run([OTELCOL, "validate", f"--config={path}"], capture_output=True, text=True, timeout=30)
     if proc.returncode != 0:
         raise RuntimeError((proc.stdout or "") + (proc.stderr or ""))
 
 
-def apply_policy(policy: Policy) -> None:
+def apply_config(backends: BackendConfig, allowlist: frozenset[str]) -> None:
     fd, filename = tempfile.mkstemp(suffix=".yaml")
     os.close(fd)
     candidate = Path(filename)
     try:
-        render_config(policy, candidate)
+        render_config(backends, allowlist, candidate)
         validate_config(candidate)
         os.replace(candidate, ACTIVE)
     finally:
         candidate.unlink(missing_ok=True)
 
 
-def refresh_loop(ddb, defaults, collector, current: Policy, stop: threading.Event):
+def refresh_loop(ddb, backends: BackendConfig, collector, current: frozenset[str], stop: threading.Event):
     while not stop.wait(INTERVAL):
         try:
-            new = read_policy(ddb, defaults)
+            new = read_arize_allowlist(ddb)
         except Exception:
-            LOG.exception("Policy refresh failed; keeping last known good configuration")
+            LOG.exception("Arize allow-list refresh failed; keeping last known good configuration")
             continue
         if new == current:
             continue
         try:
-            apply_policy(new)
+            apply_config(backends, new)
             collector.send_signal(signal.SIGHUP)
             current = new
-            LOG.info(
-                "Hot policy applied: dynatrace=%s agent365=%s arize=%s arize_services=%s",
-                new.dynatrace, new.agent365, new.arize, sorted(new.arize_services),
-            )
+            LOG.info("Hot Arize allow-list applied: %s", sorted(new))
         except Exception:
-            LOG.exception("New policy was not applied")
+            LOG.exception("New Arize allow-list was not applied")
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-    )
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     if INTERVAL < 5:
-        raise ValueError("BACKEND_POLICY_REFRESH_SECONDS must be >= 5")
+        raise ValueError("ARIZE_ALLOWLIST_REFRESH_SECONDS must be >= 5")
 
-    defaults = load_defaults()
-    default_policy = Policy(
-        dynatrace=defaults["dynatrace"],
-        agent365=defaults["agent365"],
-        arize=defaults["arize"],
-        arize_services=frozenset(),
-    )
+    backends = load_backend_config()
     ddb = dynamodb_client()
+    allowlist: frozenset[str] = frozenset()
+    if backends.arize:
+        try:
+            allowlist = read_arize_allowlist(ddb)
+        except Exception:
+            LOG.exception("Initial Arize allow-list read failed; failing closed (no agents exported to Arize)")
 
-    # If DynamoDB is unavailable at startup, safe static defaults are used:
-    # Dynatrace ON, Agent365 OFF, Arize OFF (as defined in defaults YAML).
-    current = default_policy
-    try:
-        current = read_policy(ddb, defaults)
-    except Exception:
-        LOG.exception("Initial policy read failed; using collector defaults")
+    apply_config(backends, allowlist)
+    LOG.info("Starting Collector: dynatrace=%s agent365=%s arize=%s arize_allowlist=%s", backends.dynatrace, backends.agent365, backends.arize, sorted(allowlist))
 
-    apply_policy(current)
-    LOG.info(
-        "Starting Collector: dynatrace=%s agent365=%s arize=%s arize_services=%s",
-        current.dynatrace, current.agent365, current.arize, sorted(current.arize_services),
-    )
-
-    collector = subprocess.Popen(
-        [OTELCOL, f"--config={ACTIVE}"], stdout=sys.stdout, stderr=sys.stderr
-    )
+    collector = subprocess.Popen([OTELCOL, f"--config={ACTIVE}"], stdout=sys.stdout, stderr=sys.stderr)
     stop = threading.Event()
-    worker = threading.Thread(
-        target=refresh_loop,
-        args=(ddb, defaults, collector, current, stop),
-        daemon=True,
-    )
+    worker = threading.Thread(target=refresh_loop, args=(ddb, backends, collector, allowlist, stop), daemon=True)
     worker.start()
 
     def shutdown(_signum, _frame):

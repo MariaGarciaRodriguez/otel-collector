@@ -1,23 +1,30 @@
-import argparse, os, boto3
-endpoint=os.getenv('DYNAMODB_ENDPOINT','http://dynamodb-local-test:8000')
-region=os.getenv('AWS_DEFAULT_REGION','eu-west-1')
-table=os.getenv('BACKEND_POLICY_TABLE','otel-observability-backend-policy-local-test')
-ddb=boto3.client('dynamodb',endpoint_url=endpoint,region_name=region)
+import argparse
+import os
+import boto3
 
-p=argparse.ArgumentParser()
-sub=p.add_subparsers(dest='cmd',required=True)
-b=sub.add_parser('backend'); b.add_argument('name',choices=['dynatrace','agent365','arize']); b.add_argument('state',choices=['on','off'])
-a=sub.add_parser('arize-service'); a.add_argument('service_name'); a.add_argument('state',choices=['on','off'])
-sub.add_parser('list')
-args=p.parse_args()
+endpoint = os.getenv("DYNAMODB_ENDPOINT", "http://dynamodb-local-test:8000")
+region = os.getenv("AWS_DEFAULT_REGION", "eu-west-1")
+table = os.getenv("ARIZE_ALLOWLIST_TABLE", "otel-arize-enabled-agents-local-test")
+ddb = boto3.client("dynamodb", endpoint_url=endpoint, region_name=region)
 
-if args.cmd=='backend':
-    ddb.put_item(TableName=table,Item={'policy_key':{'S':f'backend#{args.name}'},'enabled':{'BOOL':args.state=='on'}})
-    print(f'{args.name}={args.state}')
-elif args.cmd=='arize-service':
-    key={'policy_key':{'S':f'arize_service#{args.service_name}'}}
-    if args.state=='on': ddb.put_item(TableName=table,Item={**key,'enabled':{'BOOL':True}})
-    else: ddb.delete_item(TableName=table,Key=key)
-    print(f'Arize service {args.service_name}={args.state}')
+p = argparse.ArgumentParser(description="Manage the hot Arize/Phoenix agent allow-list")
+sub = p.add_subparsers(dest="cmd", required=True)
+a = sub.add_parser("add"); a.add_argument("agent_id")
+r = sub.add_parser("remove"); r.add_argument("agent_id")
+sub.add_parser("list")
+args = p.parse_args()
+
+if args.cmd == "add":
+    ddb.put_item(TableName=table, Item={"agent_id": {"S": args.agent_id}})
+    print(f"Added to Arize allow-list: {args.agent_id}")
+elif args.cmd == "remove":
+    ddb.delete_item(TableName=table, Key={"agent_id": {"S": args.agent_id}})
+    print(f"Removed from Arize allow-list: {args.agent_id}")
 else:
-    for item in ddb.scan(TableName=table).get('Items',[]): print(item)
+    items = ddb.scan(TableName=table, ProjectionExpression="agent_id").get("Items", [])
+    ids = sorted(i["agent_id"]["S"] for i in items if "agent_id" in i)
+    print("Arize allow-list:")
+    for agent_id in ids:
+        print(f"- {agent_id}")
+    if not ids:
+        print("(empty)")
